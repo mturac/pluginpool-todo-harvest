@@ -36,29 +36,80 @@ def _list_files(repo: str) -> list[str]:
 
 
 def _marker_pattern(markers: Iterable[str]) -> re.Pattern:
+    """Match a marker word followed by common decorations.
+
+    Accepts ``TODO:``, ``TODO foo``, ``TODO(user):``, ``FIXME[ABC-123]:``,
+    ``HACK!`` and the bare standalone form. Previously only ``MARKER:`` or
+    ``MARKER`` followed by whitespace would match — that lost a huge fraction
+    of real-world annotations.
+    """
     escaped = [re.escape(m) for m in markers]
-    return re.compile(r"\b(" + "|".join(escaped) + r")\b[:\s](.*)$")
+    body = "(?:[(\\[][^)\\]]*[)\\]])?[:!\\s]?(.*)$"
+    return re.compile(r"\b(" + "|".join(escaped) + r")\b" + body)
 
 
-def _blame(repo: str, path: str, line: int) -> dict:
-    out = _run(
-        ["git", "blame", "--porcelain", "-L", f"{line},{line}", "--", path],
-        repo,
-    )
-    author = ""
-    epoch = 0
-    commit = ""
-    for ln in out.splitlines():
-        if not commit and re.match(r"^[0-9a-f]{7,40} ", ln):
-            commit = ln.split(" ", 1)[0]
-        if ln.startswith("author "):
-            author = ln[len("author "):].strip()
-        elif ln.startswith("author-time "):
+_HEADER_RE = re.compile(r"^([0-9a-f]{7,40}) (\d+) (\d+)(?: (\d+))?$")
+
+
+def _blame_file(repo: str, path: str) -> dict[int, dict]:
+    """Run ``git blame --porcelain`` once per file and return ``{line: blame}``.
+
+    The original implementation spawned one subprocess per marker, which on a
+    repo with 500 TODOs meant 500 ``git blame`` invocations. Batching by file
+    drops the cost to N(files-with-markers) — typically <50 — and keeps the
+    porcelain parsing trivial because every block is a single-line range
+    starting with the commit-id header.
+    """
+    out = _run(["git", "blame", "--porcelain", "--", path], repo)
+    commits: dict[str, dict[str, str | int]] = {}
+    lines: dict[int, dict] = {}
+    current_commit = ""
+    current_lineno = 0
+
+    for raw in out.splitlines():
+        header = _HEADER_RE.match(raw)
+        if header:
+            current_commit = header.group(1)
+            current_lineno = int(header.group(3))
+            commits.setdefault(current_commit, {"author": "", "author_time": 0, "author_mail": ""})
+            lines[current_lineno] = {"commit": current_commit}
+            continue
+        if not current_commit:
+            continue
+        record = commits[current_commit]
+        if raw.startswith("author "):
+            record["author"] = raw[len("author "):].strip()
+        elif raw.startswith("author-mail "):
+            record["author_mail"] = raw[len("author-mail "):].strip()
+        elif raw.startswith("author-time "):
             try:
-                epoch = int(ln[len("author-time "):].strip())
+                record["author_time"] = int(raw[len("author-time "):].strip())
             except ValueError:
-                epoch = 0
-    return {"author": author, "commit": commit, "author_time": epoch}
+                record["author_time"] = 0
+        # Lines starting with '\t' are the actual source content — we ignore them.
+
+    # Flatten commit metadata into each line entry.
+    for lineno, entry in lines.items():
+        commit_meta = commits.get(entry["commit"], {"author": "", "author_time": 0})
+        entry["author"] = commit_meta.get("author", "")
+        entry["author_time"] = commit_meta.get("author_time", 0)
+        entry["author_mail"] = commit_meta.get("author_mail", "")
+    return lines
+
+
+def _blame(repo: str, path: str, line: int, *, cache: dict[str, dict[int, dict]] | None = None) -> dict:
+    """Single-line lookup that uses the file-level cache when supplied."""
+    if cache is not None:
+        if path not in cache:
+            cache[path] = _blame_file(repo, path)
+        entry = cache[path].get(line, {})
+    else:
+        entry = _blame_file(repo, path).get(line, {})
+    return {
+        "author": entry.get("author", ""),
+        "commit": entry.get("commit", ""),
+        "author_time": int(entry.get("author_time", 0) or 0),
+    }
 
 
 def _age_days(epoch: int, now: dt.datetime | None = None) -> int:
@@ -88,34 +139,40 @@ def harvest(repo: str, markers: tuple[str, ...] = DEFAULT_MARKERS, min_age: int 
         return []
     pat = _marker_pattern(markers)
     hits: list[dict] = []
+    blame_cache: dict[str, dict[int, dict]] = {}
     for rel in _list_files(repo):
         abs_path = os.path.join(repo, rel)
         if not os.path.isfile(abs_path) or _is_binary(abs_path):
             continue
         try:
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                file_lines: list[tuple[int, str, str]] = []
                 for n, line in enumerate(f, 1):
                     m = pat.search(line)
-                    if not m:
-                        continue
-                    marker, text = m.group(1), m.group(2).strip()
-                    blame = _blame(repo, rel, n)
-                    age = _age_days(blame["author_time"])
-                    if age >= 0 and age < min_age:
-                        continue
-                    hits.append(
-                        {
-                            "path": rel,
-                            "line": n,
-                            "marker": marker,
-                            "text": text,
-                            "author": blame["author"],
-                            "age_days": age,
-                            "commit": blame["commit"],
-                        }
-                    )
+                    if m:
+                        marker, text = m.group(1), m.group(2).strip()
+                        file_lines.append((n, marker, text))
         except OSError:
             continue
+        if not file_lines:
+            continue
+        # Single ``git blame`` call per file — O(files-with-markers) processes
+        # rather than O(markers). See review #1 finding.
+        blame_cache[rel] = _blame_file(repo, rel)
+        for n, marker, text in file_lines:
+            entry = blame_cache[rel].get(n, {})
+            age = _age_days(int(entry.get("author_time", 0) or 0))
+            if age >= 0 and age < min_age:
+                continue
+            hits.append({
+                "path": rel,
+                "line": n,
+                "marker": marker,
+                "text": text,
+                "author": entry.get("author", ""),
+                "age_days": age,
+                "commit": entry.get("commit", ""),
+            })
     hits.sort(key=lambda h: (-h["age_days"], h["path"], h["line"]))
     return hits
 
@@ -126,8 +183,9 @@ def _render_markdown(hits: list[dict]) -> str:
     out = ["| age (d) | marker | file:line | author | note |", "|---|---|---|---|---|"]
     for h in hits:
         note = h["text"].replace("|", "\\|")
+        age_cell = "?" if h["age_days"] < 0 else str(h["age_days"])
         out.append(
-            f"| {h['age_days']} | {h['marker']} | {h['path']}:{h['line']} | {h['author']} | {note} |"
+            f"| {age_cell} | {h['marker']} | {h['path']}:{h['line']} | {h['author']} | {note} |"
         )
     return "\n".join(out) + "\n"
 
