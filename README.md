@@ -1,3 +1,5 @@
+![hero](./assets/hero.svg)
+
 # todo-harvest
 
 **Find the oldest, most-forgotten TODOs and put their authors on blast (constructively).**
