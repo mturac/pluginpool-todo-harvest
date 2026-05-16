@@ -68,6 +68,10 @@ python3 scripts/harvest.py --markers TODO,FIXME --format json
 - "Age" is the age of the *current* line. Renames and reformats reset the clock.
 - Unicode-safe (decodes with `errors="replace"`).
 
+## Examples
+
+Step-by-step walkthroughs with real input fixtures and the helper's actual output live in [`examples/`](./examples/README.md). Three or four scenarios per plugin — from the happy path to the edge cases the test suite guards.
+
 ## Part of the pluginpool family
 
 Ten focused Claude Code plugins for everyday productivity:
